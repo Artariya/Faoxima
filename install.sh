@@ -1978,7 +1978,7 @@ install_bot() {
     }
 
     ui_action "Building images (this can take a few minutes)..."
-    dc build app || { ui_err "docker compose build failed."; exit 1; }
+    dc build --pull app || { ui_err "docker compose build failed."; exit 1; }
 
     ui_action "Generating a temporary self-signed certificate so nginx can start..."
     ensure_dummy_cert "$domainname" || ui_warn "Could not generate a temporary certificate — nginx may fail to start until SSL is issued."
@@ -3007,7 +3007,7 @@ update_bot_source() {
 
     if [ "$should_build" = "1" ]; then
         ui_action "Rebuilding the app image for '${label}'..."
-        dc build "$app_service" || { ui_err "Rebuilding the app image for '${label}' failed. Update remains pending; retry after fixing the build error."; return 1; }
+        dc build --pull "$app_service" || { ui_err "Rebuilding the app image for '${label}' failed. Update remains pending; retry after fixing the build error."; return 1; }
     fi
     ui_action "Restarting services for '${label}' with the updated source..."
     dc up -d --no-deps "$app_service" || { normalize_source_permissions "$code_dir" || true; ui_err "Failed to bring '${label}' services back up."; return 1; }
@@ -6120,6 +6120,94 @@ menu_domain_ssl() {
     printf '\n  %s❯%s Press Enter to continue... ' "$C_YELLOW" "$C_RESET"; read -r
 }
 
+upgrade_php_runtime() {
+    local target_version="8.2.35"
+    local dockerfile="${PROJECT_DIR}/docker/php/Dockerfile"
+    show_logo
+    ui_panel "UPDATE PHP TO ${target_version}" "$C_BOLD$C_GREEN" "$C_GREEN" \
+        "${C_WHITE}Rebuilds PHP and restarts the main app and running bot containers.${C_RESET}" \
+        "${C_DIM}Brief downtime during restart. Application source is not downloaded.${C_RESET}"
+
+    if [ ! -f "$COMPOSE_FILE" ] || [ ! -f "$ENV_FILE" ] || [ ! -f "$dockerfile" ]; then
+        ui_err "Installed Docker configuration was not found at ${PROJECT_DIR}."
+        return 1
+    fi
+    if ! grep -qE '^FROM php:8\.2([.][0-9]+)?-fpm[[:space:]]*$' "$dockerfile"; then
+        ui_err "Expected a PHP 8.2 FPM Dockerfile. Custom base images must be updated manually."
+        return 1
+    fi
+
+    local running_services svc current_version backup
+    local app_services=(app)
+    running_services=$(dc ps --services --status running) || return 1
+    while IFS= read -r svc; do
+        case "$svc" in app_*) app_services+=("$svc") ;; esac
+    done <<< "$running_services"
+    for svc in "${app_services[@]}"; do
+        current_version=$(dc exec -T "$svc" php -r 'echo PHP_VERSION;' 2>/dev/null) || current_version=""
+        if [ -n "$current_version" ] && dpkg --compare-versions "$current_version" gt "$target_version"; then
+            ui_err "${svc} already runs newer PHP ${current_version}; refusing to downgrade it."
+            return 1
+        fi
+    done
+
+    backup=$(mktemp "${dockerfile}.backup.XXXXXX") || return 1
+    if ! cp -p "$dockerfile" "$backup"; then
+        rm -f "$backup"
+        return 1
+    fi
+    if ! sed -i -E "s/^FROM php:8\\.2([.][0-9]+)?-fpm[[:space:]]*$/FROM php:${target_version}-fpm/" "$dockerfile"; then
+        cp -p "$backup" "$dockerfile" && rm -f "$backup"
+        ui_err "Failed to update the Dockerfile."
+        return 1
+    fi
+
+    ui_action "Building PHP ${target_version} with the existing extensions..."
+    if ! dc build --pull app; then
+        cp -p "$backup" "$dockerfile" && rm -f "$backup"
+        ui_err "Build failed; existing containers were not restarted."
+        return 1
+    fi
+    ui_action "Checking the new PHP image before restarting..."
+    if ! dc run --rm --no-deps --entrypoint php app -r \
+        'echo "PHP ", PHP_VERSION, PHP_EOL; if (PHP_VERSION !== $argv[1]) exit(1); foreach (["mysqli", "pdo_mysql", "mbstring", "zip", "gd", "curl", "soap"] as $ext) { if (!extension_loaded($ext)) { fwrite(STDERR, "Missing extension: $ext\n"); exit(1); } }' "$target_version" \
+        || ! dc run --rm --no-deps --entrypoint php-fpm app -t; then
+        cp -p "$backup" "$dockerfile" && rm -f "$backup"
+        ui_err "Image checks failed; existing containers were not restarted."
+        return 1
+    fi
+    rm -f "$backup"
+
+    ui_action "Recreating app containers with PHP ${target_version}..."
+    local restart_ok=1
+    dc up -d --no-deps --no-build --pull never --force-recreate "${app_services[@]}" || restart_ok=0
+    # nginx must resolve the recreated containers' addresses, including after a partial failure.
+    dc restart nginx || restart_ok=0
+    if [ "$restart_ok" != "1" ]; then
+        ui_err "Service restart failed. Check Service Status & Management and container logs."
+        return 1
+    fi
+
+    local verified=0 attempt
+    for attempt in {1..30}; do
+        verified=1
+        for svc in "${app_services[@]}"; do
+            current_version=$(dc exec -T "$svc" php -r 'echo PHP_VERSION;' 2>/dev/null) || current_version=""
+            [ "$current_version" = "$target_version" ] || verified=0
+        done
+        [ "$verified" = "1" ] && break
+        sleep 1
+    done
+    if [ "$verified" != "1" ]; then
+        ui_err "PHP ${target_version} could not be verified in every app container. Check container logs."
+        return 1
+    fi
+    for svc in "${app_services[@]}"; do
+        ui_ok "${svc}: PHP ${target_version}"
+    done
+    ui_info "phpMyAdmin uses a separate image and is not updated by this option."
+}
+
 menu_maintenance() {
     show_logo
     ui_menu_list "Maintenance" \
@@ -6129,10 +6217,11 @@ menu_maintenance() {
         "${C_WHITE}[4]${C_RESET} Service Status & Management" \
         "${C_WHITE}[5]${C_RESET} Set Max Database Connections" \
         "${C_WHITE}[6]${C_RESET} phpMyAdmin (Enable / Disable)" \
-        "${C_RED}[7]${C_RESET} Back to main menu"
+        "${C_WHITE}[7]${C_RESET} Update PHP to 8.2.35 (Temporary)" \
+        "${C_RED}[8]${C_RESET} Back to main menu"
 
     local option
-    printf '  %s❯%s Select an option [1-7]: ' "$C_YELLOW" "$C_RESET"
+    printf '  %s❯%s Select an option [1-8]: ' "$C_YELLOW" "$C_RESET"
     read -r option
 
     case "$option" in
@@ -6142,7 +6231,8 @@ menu_maintenance() {
         4) menu_service_management ;;
         5) set_max_connections ;;
         6) manage_phpmyadmin ;;
-        7) return 0 ;;
+        7) upgrade_php_runtime ;;
+        8) return 0 ;;
         *)
             ui_err "Invalid option. Please try again."
             sleep 2
